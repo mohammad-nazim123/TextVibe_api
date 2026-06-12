@@ -2,6 +2,12 @@ from rest_framework import serializers
 from .models import Payment, TokenPackage
 
 
+def _validate_active_package_id(value):
+    if not TokenPackage.objects.filter(id=value, is_active=True).exists():
+        raise serializers.ValidationError("Invalid or inactive package.")
+    return value
+
+
 class TokenPackageSerializer(serializers.ModelSerializer):
     class Meta:
         model = TokenPackage
@@ -11,26 +17,30 @@ class TokenPackageSerializer(serializers.ModelSerializer):
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
-        fields = ["id", "razorpay_order_id", "amount", "tokens", "status", "created_at"]
-        read_only_fields = ["id", "razorpay_order_id", "status", "created_at"]
+        fields = [
+            "id",
+            "razorpay_order_id",
+            "payment_method",
+            "amount",
+            "tokens",
+            "status",
+            "created_at",
+        ]
+        read_only_fields = ["id", "razorpay_order_id", "payment_method", "status", "created_at"]
 
-
-class InitiatePaymentSerializer(serializers.Serializer):
-    """Initiate a payment by selecting a token package."""
+class PurchasePaymentSerializer(serializers.Serializer):
+    """Complete a temporary direct purchase without an external gateway."""
 
     package_id = serializers.IntegerField()
+    payment_method = serializers.ChoiceField(
+        choices=[
+            Payment.PAYMENT_METHOD_GOOGLE_PLAY,
+            Payment.PAYMENT_METHOD_UPI,
+            Payment.PAYMENT_METHOD_CARD,
+            Payment.PAYMENT_METHOD_NETBANKING,
+            Payment.PAYMENT_METHOD_WALLET,
+        ]
+    )
 
     def validate_package_id(self, value):
-        try:
-            package = TokenPackage.objects.get(id=value, is_active=True)
-        except TokenPackage.DoesNotExist:
-            raise serializers.ValidationError("Invalid or inactive package.")
-        return value
-
-
-class VerifyPaymentSerializer(serializers.Serializer):
-    """Verify payment from Razorpay webhook."""
-
-    razorpay_order_id = serializers.CharField()
-    razorpay_payment_id = serializers.CharField()
-    razorpay_signature = serializers.CharField()
+        return _validate_active_package_id(value)

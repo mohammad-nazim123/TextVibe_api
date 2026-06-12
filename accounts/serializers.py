@@ -49,6 +49,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = (
             "id",
             "email",
+            "phone_number",
             "name",
             "avatar",
             "tokens",

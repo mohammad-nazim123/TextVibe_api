@@ -71,6 +71,10 @@ class Post(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["-created_at"], name="post_created_desc_idx"),
+            models.Index(fields=["user", "-created_at"], name="post_user_created_idx"),
+        ]
 
     def __str__(self):
         return f"Post #{self.pk} by {self.user}"
@@ -78,25 +82,6 @@ class Post(models.Model):
     def calculate_token_cost(self):
         """Calculate the token cost for this post based on its properties."""
         cost = 0
-
-        # 1 token per non-whitespace character
-        cost += len(self.text.replace(" ", "").replace("\n", "").replace("\t", ""))
-
-        # Background texture or color cost
-        if self.background_texture:
-            texture = self.background_texture.get("texture", "")
-            cost += 30 if texture.startswith("legendary_") else 20
-        elif self.background_color and self.background_color.lower() != "#ffffff":
-            cost += 4
-
-        # Border cost
-        if self.border:
-            style = self.border.get("style", "")
-            if style == "texture":
-                texture = self.border.get("texture", "")
-                cost += 30 if texture.startswith("legendary_") else 20
-            else:
-                cost += 4
 
         # Duration cost
         duration_cost_map = {3: 5, 5: 7, 10: 12, 30: 30}

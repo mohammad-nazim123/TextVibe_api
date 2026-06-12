@@ -29,6 +29,61 @@ from .services.sms_service import send_otp_sms
 
 logger = logging.getLogger("accounts")
 
+_ASSET_ID_ALIASES = {
+    "dark_wood": "premium_dark_wood",
+    "glass": "premium_glass",
+    "marble": "premium_marble",
+    "legendary_golden": "legendary_gold",
+    "legendary_rose_gold": "legendary_rosy_gold",
+}
+
+
+def _normalize_asset_id(value):
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return _ASSET_ID_ALIASES.get(normalized, normalized)
+
+
+def _uses_unsupported_asset(value):
+    normalized = _normalize_asset_id(value)
+    return normalized is not None and (
+        normalized.startswith("premium_") or normalized.startswith("legendary_")
+    )
+
+
+def _style_runs_use_unsupported_effect(style_runs):
+    if not isinstance(style_runs, list):
+        return False
+    for run in style_runs:
+        if not isinstance(run, dict):
+            continue
+        if run.get("effect") == "legendary":
+            return True
+        if run.get("legendaryColor") or run.get("legendaryMaterial"):
+            return True
+    return False
+
+
+def _payload_uses_unsupported_tier(validated_data):
+    background_texture = validated_data.get("background_texture")
+    if isinstance(background_texture, dict) and _uses_unsupported_asset(
+        background_texture.get("texture")
+    ):
+        return True
+
+    border = validated_data.get("border")
+    if isinstance(border, dict) and _uses_unsupported_asset(border.get("texture")):
+        return True
+
+    return (
+        _uses_unsupported_asset(validated_data.get("background_id"))
+        or _uses_unsupported_asset(validated_data.get("frame_id"))
+        or _style_runs_use_unsupported_effect(validated_data.get("style_runs"))
+    )
+
 
 def _ensure_dev_bonus_tokens(user: User) -> None:
     """Keep local/dev sign-in aligned with the Flutter app's starter balance."""
@@ -227,10 +282,41 @@ class PostListCreateView(generics.ListCreateAPIView):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_queryset(self):
-        return self.request.user.posts.all()
+        return (
+            self.request.user.posts.only(
+                "id",
+                "user_id",
+                "text",
+                "image",
+                "canvas_image",
+                "text_image",
+                "text_canvas_width",
+                "text_canvas_height",
+                "background_color",
+                "background_texture",
+                "style_runs",
+                "border",
+                "frame_id",
+                "background_id",
+                "duration_seconds",
+                "created_at",
+            )
+            .order_by("-created_at")
+        )
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        data = dict(serializer.data)
+        data["user_tokens"] = getattr(self, "_updated_user_tokens", request.user.tokens)
+        headers = self.get_success_headers(serializer.data)
+        return Response(data, status=status.HTTP_201_CREATED, headers=headers)
 
     def perform_create(self, serializer):
         _ensure_dev_bonus_tokens(self.request.user)
+        if _payload_uses_unsupported_tier(serializer.validated_data):
+            raise ValidationError("Coming soon.")
         # Calculate cost from validated data without saving
         temp_post = Post(
             text=serializer.validated_data.get('text', ''),
@@ -242,18 +328,18 @@ class PostListCreateView(generics.ListCreateAPIView):
         )
 
         cost = temp_post.calculate_token_cost()
-        user = self.request.user
-
-        if cost > user.tokens:
-            raise ValidationError(
-                f"Not enough tokens. This message costs {cost} tokens but you have {user.tokens}."
-            )
-
-        # Use transaction to ensure post and token deduction happen together
         with transaction.atomic():
-            post = serializer.save(user=self.request.user)
+            user = User.objects.select_for_update().only("id", "tokens").get(
+                pk=self.request.user.pk
+            )
+            if cost > user.tokens:
+                raise ValidationError(
+                    f"Not enough tokens. This message costs {cost} tokens but you have {user.tokens}."
+                )
+            serializer.save(user=user)
             user.tokens -= cost
             user.save(update_fields=["tokens"])
+            self._updated_user_tokens = user.tokens
 
 
 class BillboardView(generics.ListAPIView):
@@ -264,11 +350,37 @@ class BillboardView(generics.ListAPIView):
     permission_classes = [AllowAny]
 
     def get_queryset(self):
-        qs = Post.objects.select_related("user").all()
+        qs = Post.objects.select_related("user").only(
+            "id",
+            "user_id",
+            "text",
+            "image",
+            "canvas_image",
+            "text_image",
+            "text_canvas_width",
+            "text_canvas_height",
+            "background_color",
+            "background_texture",
+            "style_runs",
+            "border",
+            "frame_id",
+            "background_id",
+            "duration_seconds",
+            "created_at",
+            "user__id",
+            "user__name",
+            "user__avatar",
+        )
         user = self.request.query_params.get("user")
         if user:
             qs = qs.filter(user_id=user)
-        return qs.order_by("-created_at")[:50]
+        after = self.request.query_params.get("after")
+        if after not in (None, ""):
+            try:
+                qs = qs.filter(id__gt=max(0, int(after)))
+            except ValueError as exc:
+                raise ValidationError("after must be an integer post id.") from exc
+        return qs.order_by("-created_at", "-id")[:50]
 
 
 class LogoutView(APIView):

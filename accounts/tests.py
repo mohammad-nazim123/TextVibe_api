@@ -1,14 +1,17 @@
 import io
 import tempfile
+from datetime import timedelta
 from unittest.mock import patch
 
 import fakeredis
+from django.conf import settings
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from accounts.models import Post, User
 from accounts.services import otp_service
@@ -74,6 +77,26 @@ class OtpFlowTests(APITestCase):
             User.objects.filter(phone_number=PHONE, is_verified=True).exists()
         )
         self.assertIsNone(self.fake.get(f"otp:{PHONE}"))  # destroyed on success
+
+    def test_refresh_token_lifetime_is_extended(self):
+        self.assertEqual(
+            settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"], timedelta(days=365)
+        )
+
+    def test_refresh_token_rotates_without_relogin(self):
+        user = User.objects.create(phone_number=PHONE, is_verified=True)
+        refresh = RefreshToken.for_user(user)
+
+        res = self.client.post(
+            "/api/auth/token/refresh/",
+            {"refresh": str(refresh)},
+            format="json",
+        )
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("access", res.data)
+        self.assertIn("refresh", res.data)
+        self.assertNotEqual(res.data["refresh"], str(refresh))
 
     def test_reuse_after_success_fails(self):
         self._send()
@@ -217,8 +240,88 @@ class OtpFlowTests(APITestCase):
         )
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
         user.refresh_from_db()
-        # "Hello world" = 10 chars (no spaces), duration 5 = 7 tokens, total = 17
-        self.assertEqual(user.tokens, 83)
+        self.assertEqual(user.tokens, 93)
+        self.assertEqual(res.data["user_tokens"], 93)
+
+    def test_create_post_normal_background_and_border_are_free(self):
+        self._login()
+        user = User.objects.get(phone_number=PHONE)
+        user.tokens = 100
+        user.save()
+        res = self.client.post(
+            "/api/auth/posts/",
+            {
+                "text": "Hello world",
+                "background_color": "#fff5f8",
+                "border": {
+                    "width": 6,
+                    "style": "double",
+                    "color": "#8b5cf6",
+                    "radius": 28,
+                },
+                "duration_seconds": 5,
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        user.refresh_from_db()
+        self.assertEqual(user.tokens, 93)
+        self.assertEqual(res.data["user_tokens"], 93)
+
+    def test_create_post_rejects_premium_background_texture(self):
+        self._login()
+        user = User.objects.get(phone_number=PHONE)
+        user.tokens = 100
+        user.save()
+        res = self.client.post(
+            "/api/auth/posts/",
+            {
+                "text": "Hello world",
+                "background_texture": {
+                    "style": "texture",
+                    "texture": "premium_wood",
+                },
+                "duration_seconds": 5,
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(res.data["detail"], "Coming soon.")
+        user.refresh_from_db()
+        self.assertEqual(user.tokens, 100)
+        self.assertEqual(user.posts.count(), 0)
+
+    def test_create_post_rejects_legendary_style_run_effect(self):
+        self._login()
+        user = User.objects.get(phone_number=PHONE)
+        user.tokens = 100
+        user.save()
+        res = self.client.post(
+            "/api/auth/posts/",
+            {
+                "text": "Hello world",
+                "style_runs": [
+                    {
+                        "text": "Hello world",
+                        "color": "#e8c56a",
+                        "fontFamily": "Roboto",
+                        "fontSize": 18,
+                        "fontWeight": 400,
+                        "fontStyle": "normal",
+                        "effect": "legendary",
+                        "legendaryColor": "#e8c56a",
+                        "legendaryMaterial": "gold",
+                    }
+                ],
+                "duration_seconds": 5,
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(res.data["detail"], "Coming soon.")
+        user.refresh_from_db()
+        self.assertEqual(user.tokens, 100)
+        self.assertEqual(user.posts.count(), 0)
 
     def test_create_post_fails_if_not_enough_tokens(self):
         self._login()
@@ -237,7 +340,7 @@ class OtpFlowTests(APITestCase):
 
     @override_settings(MEDIA_ROOT=tempfile.mkdtemp())
     def test_billboard_feed_includes_rendering_payload(self):
-        user = User.objects.create_user(
+        user = User.objects.create(
             phone_number=PHONE,
             name="Nazim",
             is_verified=True,
@@ -323,3 +426,11 @@ class OtpFlowTests(APITestCase):
         self.assertEqual(payload["text_canvas_height"], 768)
         self.assertRegex(payload["user_avatar"], r"^https?://testserver")
         self.assertTrue(payload["user_avatar"].endswith(user.avatar.url))
+
+        self.assertEqual(
+            self.client.get(f"/api/billboard/?after={post.id}").data,
+            [],
+        )
+        replay_res = self.client.get("/api/billboard/?after=0")
+        self.assertEqual(replay_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(replay_res.data), 1)
