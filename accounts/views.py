@@ -22,6 +22,7 @@ from .serializers import (
     PostSerializer,
     ProfileUpdateSerializer,
     SendOtpSerializer,
+    SupportMessageSerializer,
     UserSerializer,
     VerifyEmailOtpSerializer,
     VerifyOtpSerializer,
@@ -94,7 +95,7 @@ class VerifyOtpView(APIView):
 
         user, created = User.objects.get_or_create(phone_number=phone)
         if created:
-            user.tokens = 100
+            user.tokens = 25
             user.save(update_fields=["tokens"])
         if not user.is_verified:
             user.is_verified = True
@@ -182,7 +183,7 @@ class VerifyEmailOtpView(APIView):
 
         user, created = User.objects.get_or_create(email=email)
         if created:
-            user.tokens = 100
+            user.tokens = 25
             user.save(update_fields=["tokens"])
         if not user.is_verified:
             user.is_verified = True
@@ -404,6 +405,28 @@ class BillboardView(generics.ListAPIView):
         if after is not None:
             qs = qs.filter(id__gt=after)
         return qs.order_by("-created_at", "-id")[:50]
+
+
+class SupportMessageListCreateView(generics.ListCreateAPIView):
+    """List the signed-in user's support messages and create a new one.
+
+    Tuned for the compact Support panel: scoped to ``request.user`` (backed by
+    the ``(user, -created_at)`` index), fetches only the three columns the panel
+    renders, and caps the list at the 50 newest rows for a small, bounded
+    payload (GZip-compressed by the project's middleware)."""
+
+    serializer_class = SupportMessageSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return (
+            self.request.user.support_messages.only(
+                "id", "message", "created_at"
+            ).order_by("-created_at")[:50]
+        )
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
 
 
 class LogoutView(APIView):

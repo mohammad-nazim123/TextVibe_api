@@ -3,7 +3,7 @@ import re
 
 from rest_framework import serializers
 
-from .models import Post, User
+from .models import Post, SupportMessage, User
 
 _PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
 
@@ -193,3 +193,18 @@ class BillboardPostSerializer(serializers.ModelSerializer):
         url = obj.user.avatar.url
         request = self.context.get("request")
         return request.build_absolute_uri(url) if request else url
+
+
+class SupportMessageSerializer(serializers.ModelSerializer):
+    """Slim serializer for the per-user support thread (3 fields, no joins)."""
+
+    class Meta:
+        model = SupportMessage
+        fields = ("id", "message", "created_at")
+        read_only_fields = ("id", "created_at")
+
+    def validate_message(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Message cannot be empty.")
+        return value[:2000]

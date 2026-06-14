@@ -92,3 +92,24 @@ class Post(models.Model):
             cost += 25
 
         return cost
+
+
+class SupportMessage(models.Model):
+    """A free-text message a signed-in user sends from the Support page."""
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="support_messages"
+    )
+    message = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(
+                fields=["user", "-created_at"], name="support_user_created_idx"
+            ),
+        ]
+
+    def __str__(self):
+        return f"SupportMessage #{self.pk} by {self.user}"

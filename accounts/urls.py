@@ -7,6 +7,7 @@ from .views import (
     PostListCreateView,
     ProfileView,
     SendOtpView,
+    SupportMessageListCreateView,
     VerifyEmailOtpView,
     VerifyOtpView,
 )
@@ -20,6 +21,7 @@ urlpatterns = [
     path("verify-otp/", VerifyOtpView.as_view(), name="verify-otp"),
     path("profile/", ProfileView.as_view(), name="profile"),
     path("posts/", PostListCreateView.as_view(), name="posts"),
+    path("support/", SupportMessageListCreateView.as_view(), name="support"),
     path("logout/", LogoutView.as_view(), name="logout"),
     path("token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
 ]
