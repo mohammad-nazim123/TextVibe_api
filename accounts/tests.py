@@ -1,5 +1,7 @@
 import io
 import tempfile
+import threading
+import time
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -7,16 +9,20 @@ import fakeredis
 from django.conf import settings
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 from PIL import Image
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from accounts import realtime
 from accounts.models import Post, User
 from accounts.services import otp_service
 
 PHONE = "+919876543210"
+EMAIL = "mohammadnazim8273976364@gmail.com"
 KNOWN_OTP = "123456"
 
 
@@ -45,6 +51,9 @@ class OtpFlowTests(APITestCase):
         self.client.defaults["HTTP_X_FORWARDED_PROTO"] = "https"
         self.client.defaults["SERVER_PORT"] = "443"
         cache.clear()
+        # The realtime latest-post cache is module state; tests roll back the
+        # DB between runs, so a stale id would wrongly short-circuit the feed.
+        realtime._reset_for_tests()
 
     def _send(self, phone=PHONE):
         return self.client.post(
@@ -55,6 +64,18 @@ class OtpFlowTests(APITestCase):
         return self.client.post(
             "/api/auth/verify-otp/",
             {"phone_number": phone, "otp": otp},
+            format="json",
+        )
+
+    def _send_email(self, email=EMAIL):
+        return self.client.post(
+            "/api/auth/google-auth/", {"email": email}, format="json"
+        )
+
+    def _verify_email(self, otp=KNOWN_OTP, email=EMAIL):
+        return self.client.post(
+            "/api/auth/verify-email-otp/",
+            {"email": email, "otp": otp},
             format="json",
         )
 
@@ -83,25 +104,21 @@ class OtpFlowTests(APITestCase):
             settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"], timedelta(days=365)
         )
 
-    def test_refresh_token_rotates_without_relogin(self):
-        user = User.objects.create(phone_number=PHONE, is_verified=True)
-        refresh = RefreshToken.for_user(user)
-
-        res = self.client.post(
-            "/api/auth/token/refresh/",
-            {"refresh": str(refresh)},
-            format="json",
-        )
-
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertIn("access", res.data)
-        self.assertIn("refresh", res.data)
-        self.assertNotEqual(res.data["refresh"], str(refresh))
-
     def test_reuse_after_success_fails(self):
         self._send()
         self._verify()
         self.assertEqual(self._verify().status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_previous_unexpired_code_still_works_after_resend(self):
+        self._send()
+        first_code = KNOWN_OTP
+        self.fake.delete(f"otp_cooldown:{PHONE}")
+
+        with patch.object(otp_service.secrets, "randbelow", return_value=654321):
+            self._send()
+
+        res = self._verify(first_code)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
 
     def test_existing_user_is_not_marked_new(self):
         self._send()
@@ -135,6 +152,57 @@ class OtpFlowTests(APITestCase):
             "/api/auth/send-otp/", {"phone_number": "abc"}, format="json"
         )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_email_otp_waits_for_confirmed_delivery_and_stores_hash(self):
+        with patch("accounts.views.send_otp_email") as send_email:
+            res = self._send_email()
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        send_email.assert_called_once_with(EMAIL, KNOWN_OTP)
+        stored = self.fake.get(f"otp:{EMAIL}")
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored, otp_service._digest(EMAIL, KNOWN_OTP))
+
+    def test_email_otp_delivery_failure_clears_code_and_cooldown(self):
+        with patch(
+            "accounts.views.send_otp_email", side_effect=RuntimeError("smtp down")
+        ):
+            res = self._send_email()
+
+        self.assertEqual(res.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertIsNone(self.fake.get(f"otp:{EMAIL}"))
+        self.assertIsNone(self.fake.get(f"otp_cooldown:{EMAIL}"))
+
+        with patch("accounts.views.send_otp_email") as send_email:
+            retry = self._send_email()
+
+        self.assertEqual(retry.status_code, status.HTTP_200_OK)
+        send_email.assert_called_once_with(EMAIL, KNOWN_OTP)
+
+    def test_email_otp_cooldown_blocks_after_confirmed_delivery(self):
+        with patch("accounts.views.send_otp_email") as send_email:
+            first = self._send_email()
+            second = self._send_email()
+
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        send_email.assert_called_once_with(EMAIL, KNOWN_OTP)
+
+    def test_failed_email_resend_keeps_previous_unexpired_code_valid(self):
+        with patch("accounts.views.send_otp_email"):
+            self._send_email()
+        self.fake.delete(f"otp_cooldown:{EMAIL}")
+
+        with patch.object(otp_service.secrets, "randbelow", return_value=654321):
+            with patch(
+                "accounts.views.send_otp_email",
+                side_effect=RuntimeError("smtp down"),
+            ):
+                res = self._send_email()
+
+        self.assertEqual(res.status_code, status.HTTP_502_BAD_GATEWAY)
+        verify = self._verify_email(KNOWN_OTP)
+        self.assertEqual(verify.status_code, status.HTTP_200_OK)
 
     def test_profile_requires_auth(self):
         self.assertEqual(
@@ -434,3 +502,156 @@ class OtpFlowTests(APITestCase):
         replay_res = self.client.get("/api/billboard/?after=0")
         self.assertEqual(replay_res.status_code, status.HTTP_200_OK)
         self.assertEqual(len(replay_res.data), 1)
+
+
+@override_settings(BILLBOARD_DB_RECHECK_SECONDS=60.0)
+class BillboardRealtimeTests(APITestCase):
+    """Short-circuit and long-poll behavior of the billboard feed."""
+
+    def setUp(self):
+        self.client.defaults["HTTP_X_FORWARDED_PROTO"] = "https"
+        self.client.defaults["SERVER_PORT"] = "443"
+        cache.clear()
+        realtime._reset_for_tests()
+        self.user = User.objects.create(
+            phone_number=PHONE, name="Nazim", is_verified=True, tokens=1000
+        )
+
+    def _post(self, text="hello"):
+        return Post.objects.create(user=self.user, text=text, duration_seconds=3)
+
+    def test_short_circuit_skips_feed_query_when_nothing_new(self):
+        post = self._post()
+        # First request initializes the latest-id cache (one MAX(id) query).
+        res = self.client.get(f"/api/billboard/?after={post.id}")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data, [])
+        # While the cache is fresh, an empty poll touches the DB zero times.
+        with CaptureQueriesContext(connection) as ctx:
+            res = self.client.get(f"/api/billboard/?after={post.id}")
+        self.assertEqual(res.data, [])
+        self.assertEqual(len(ctx.captured_queries), 0)
+
+    def test_long_poll_returns_immediately_when_posts_exist(self):
+        post = self._post()
+        started = time.monotonic()
+        res = self.client.get("/api/billboard/?after=0&wait=5")
+        elapsed = time.monotonic() - started
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual([p["id"] for p in res.data], [post.id])
+        self.assertLess(elapsed, 2.0)
+
+    def test_long_poll_times_out_with_empty_list(self):
+        post = self._post()
+        started = time.monotonic()
+        res = self.client.get(f"/api/billboard/?after={post.id}&wait=1")
+        elapsed = time.monotonic() - started
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data, [])
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 3.0)
+
+    def test_invalid_wait_is_treated_as_plain_poll(self):
+        post = self._post()
+        started = time.monotonic()
+        res = self.client.get(f"/api/billboard/?after={post.id}&wait=oops")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data, [])
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    @override_settings(BILLBOARD_LONGPOLL_MAX_WAIT=1)
+    def test_wait_is_clamped_to_configured_max(self):
+        post = self._post()
+        started = time.monotonic()
+        res = self.client.get(f"/api/billboard/?after={post.id}&wait=100")
+        elapsed = time.monotonic() - started
+        self.assertEqual(res.data, [])
+        self.assertLess(elapsed, 3.0)  # held ~1s, not 100s
+
+    def test_create_post_wakes_held_long_poll(self):
+        baseline = realtime.get_latest_post_id()
+        result = {}
+
+        def waiter():
+            started = time.monotonic()
+            result["woke"] = realtime.wait_for_post_after(baseline, timeout=10)
+            result["elapsed"] = time.monotonic() - started
+
+        thread = threading.Thread(target=waiter, daemon=True)
+        thread.start()
+        time.sleep(0.2)
+
+        self.client.force_authenticate(self.user)
+        with self.captureOnCommitCallbacks(execute=True):
+            res = self.client.post(
+                "/api/auth/posts/",
+                {"text": "wake up", "duration_seconds": 3},
+                format="json",
+            )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        thread.join(timeout=10)
+        self.assertTrue(result.get("woke"))
+        self.assertLess(result["elapsed"], 5.0)
+        self.assertEqual(realtime.get_latest_post_id(), res.data["id"])
+
+    def test_new_post_is_served_from_memory_without_db_queries(self):
+        baseline = self._post()
+        # Initialize the realtime cache/buffer coverage.
+        self.client.get(f"/api/billboard/?after={baseline.id}")
+        self.client.force_authenticate(self.user)
+        with self.captureOnCommitCallbacks(execute=True):
+            res = self.client.post(
+                "/api/auth/posts/",
+                {"text": "buffered", "duration_seconds": 3},
+                format="json",
+            )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        with CaptureQueriesContext(connection) as ctx:
+            feed = self.client.get(f"/api/billboard/?after={baseline.id}")
+        self.assertEqual([p["id"] for p in feed.data], [res.data["id"]])
+        self.assertEqual(feed.data[0]["text"], "buffered")
+        self.assertEqual(feed.data[0]["user_name"], "Nazim")
+        self.assertEqual(len(ctx.captured_queries), 0)
+
+    def test_buffer_is_skipped_for_user_filtered_requests(self):
+        baseline = self._post()
+        self.client.get(f"/api/billboard/?after={baseline.id}")
+        self.client.force_authenticate(self.user)
+        with self.captureOnCommitCallbacks(execute=True):
+            res = self.client.post(
+                "/api/auth/posts/",
+                {"text": "filtered", "duration_seconds": 3},
+                format="json",
+            )
+        feed = self.client.get(
+            f"/api/billboard/?after={baseline.id}&user={self.user.id}"
+        )
+        self.assertEqual([p["id"] for p in feed.data], [res.data["id"]])
+        other = self.client.get(
+            f"/api/billboard/?after={baseline.id}&user={self.user.id + 1}"
+        )
+        self.assertEqual(other.data, [])
+
+    def test_my_posts_list_is_capped_at_50(self):
+        Post.objects.bulk_create(
+            Post(user=self.user, text=f"post {i}", duration_seconds=3)
+            for i in range(55)
+        )
+        self.client.force_authenticate(self.user)
+        res = self.client.get("/api/auth/posts/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data), 50)
+
+    def test_refresh_works_without_rotation(self):
+        refresh = RefreshToken.for_user(self.user)
+        res = self.client.post(
+            "/api/auth/token/refresh/", {"refresh": str(refresh)}, format="json"
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("access", res.data)
+        self.assertNotIn("refresh", res.data)  # rotation is off
+        # The same refresh token keeps working (no blacklist-after-rotation).
+        again = self.client.post(
+            "/api/auth/token/refresh/", {"refresh": str(refresh)}, format="json"
+        )
+        self.assertEqual(again.status_code, status.HTTP_200_OK)

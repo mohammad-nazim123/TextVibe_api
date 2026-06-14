@@ -49,6 +49,10 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # First so it wraps the final response body; billboard JSON (repetitive
+    # style_runs keys) compresses ~10x. Django >=4.2 pads gzip output against
+    # BREACH, and the billboard payload is public data anyway.
+    "django.middleware.gzip.GZipMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -152,13 +156,35 @@ REST_FRAMEWORK = {
 }
 
 # === JWT ===
+# Long-lived sessions by design: the user stays signed in until they log out.
+# Rotation is off so a lost rotation response can never blacklist the stored
+# refresh token (the bug that used to kick users back to the login screen).
+# LogoutView still blacklists the refresh token on explicit logout.
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=24),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=365),
-    "ROTATE_REFRESH_TOKENS": True,
-    "BLACKLIST_AFTER_ROTATION": True,
+    "ROTATE_REFRESH_TOKENS": False,
+    "BLACKLIST_AFTER_ROTATION": False,
     "UPDATE_LAST_LOGIN": True,
 }
+
+# === Caching ===
+# LocMem on purpose: the Redis instance is remote, so a cache GET would cost a
+# network round trip comparable to the Neon query it replaces. LocMem is
+# in-process (microseconds) — right for the short-TTL response caching we do.
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "textvibe",
+        "OPTIONS": {"MAX_ENTRIES": 1000},
+    }
+}
+
+# === Billboard long-poll ===
+BILLBOARD_LONGPOLL_MAX_WAIT = 25  # seconds a /api/billboard/?wait= request may hold
+# How long the cached latest-post id stays trusted before re-checking the DB.
+# Also the worst-case extra latency if posts are created in a sibling process.
+BILLBOARD_DB_RECHECK_SECONDS = float(os.getenv("BILLBOARD_DB_RECHECK_SECONDS", "2.0"))
 
 # === Redis / OTP policy ===
 REDIS_URL = os.environ["REDIS_URL"]
@@ -185,8 +211,9 @@ EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_USE_TLS = _env_bool("EMAIL_USE_TLS", True)
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
-EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "").replace(" ", "")
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "noreply@textvibe.com")
+EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "15"))
 
 # === CORS ===
 CORS_ALLOWED_ORIGINS = _env_list("CORS_ALLOWED_ORIGINS")

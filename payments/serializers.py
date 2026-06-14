@@ -44,3 +44,16 @@ class PurchasePaymentSerializer(serializers.Serializer):
 
     def validate_package_id(self, value):
         return _validate_active_package_id(value)
+
+
+class InitiatePaymentSerializer(serializers.Serializer):
+    package_id = serializers.IntegerField()
+
+    def validate_package_id(self, value):
+        return _validate_active_package_id(value)
+
+
+class VerifyPaymentSerializer(serializers.Serializer):
+    razorpay_order_id = serializers.CharField(max_length=100)
+    razorpay_payment_id = serializers.CharField(max_length=100)
+    razorpay_signature = serializers.CharField(max_length=256)

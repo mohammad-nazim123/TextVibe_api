@@ -1,7 +1,9 @@
 import logging
+from datetime import timedelta
 
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -12,6 +14,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from . import realtime
 from .models import Post, User
 from .serializers import (
     BillboardPostSerializer,
@@ -28,61 +31,6 @@ from .services.email_service import send_otp_email
 from .services.sms_service import send_otp_sms
 
 logger = logging.getLogger("accounts")
-
-_ASSET_ID_ALIASES = {
-    "dark_wood": "premium_dark_wood",
-    "glass": "premium_glass",
-    "marble": "premium_marble",
-    "legendary_golden": "legendary_gold",
-    "legendary_rose_gold": "legendary_rosy_gold",
-}
-
-
-def _normalize_asset_id(value):
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip()
-    if not normalized:
-        return None
-    return _ASSET_ID_ALIASES.get(normalized, normalized)
-
-
-def _uses_unsupported_asset(value):
-    normalized = _normalize_asset_id(value)
-    return normalized is not None and (
-        normalized.startswith("premium_") or normalized.startswith("legendary_")
-    )
-
-
-def _style_runs_use_unsupported_effect(style_runs):
-    if not isinstance(style_runs, list):
-        return False
-    for run in style_runs:
-        if not isinstance(run, dict):
-            continue
-        if run.get("effect") == "legendary":
-            return True
-        if run.get("legendaryColor") or run.get("legendaryMaterial"):
-            return True
-    return False
-
-
-def _payload_uses_unsupported_tier(validated_data):
-    background_texture = validated_data.get("background_texture")
-    if isinstance(background_texture, dict) and _uses_unsupported_asset(
-        background_texture.get("texture")
-    ):
-        return True
-
-    border = validated_data.get("border")
-    if isinstance(border, dict) and _uses_unsupported_asset(border.get("texture")):
-        return True
-
-    return (
-        _uses_unsupported_asset(validated_data.get("background_id"))
-        or _uses_unsupported_asset(validated_data.get("frame_id"))
-        or _style_runs_use_unsupported_effect(validated_data.get("style_runs"))
-    )
 
 
 def _ensure_dev_bonus_tokens(user: User) -> None:
@@ -114,11 +62,7 @@ class SendOtpView(APIView):
 
         send_otp_sms(phone, otp)
 
-        payload = {"detail": "OTP sent."}
-        if settings.DEBUG:
-            # Dev convenience only — never exposed in production.
-            payload["otp"] = otp
-        return Response(payload, status=status.HTTP_200_OK)
+        return Response({"detail": "OTP sent."}, status=status.HTTP_200_OK)
 
 
 class VerifyOtpView(APIView):
@@ -149,6 +93,9 @@ class VerifyOtpView(APIView):
             )
 
         user, created = User.objects.get_or_create(phone_number=phone)
+        if created:
+            user.tokens = 100
+            user.save(update_fields=["tokens"])
         if not user.is_verified:
             user.is_verified = True
             user.save(update_fields=["is_verified"])
@@ -170,7 +117,8 @@ class VerifyOtpView(APIView):
 class GoogleAuthView(APIView):
     """Accept a Gmail address from the Flutter Google Sign-In flow and send an
     email OTP to that address. The client already verified ownership via Google
-    OAuth, so we trust the email and skip any additional Google token check."""
+    OAuth, so we trust the email and skip any additional Google token check.
+    The response is returned only after SMTP accepts the message."""
 
     permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
@@ -189,12 +137,20 @@ class GoogleAuthView(APIView):
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
 
-        send_otp_email(email, otp)
+        try:
+            send_otp_email(email, otp)
+        except Exception:
+            logger.exception("OTP email delivery to %s failed", email)
+            try:
+                otp_service.discard_otp(email, otp)
+            except Exception:
+                logger.exception("Could not discard failed OTP for %s", email)
+            return Response(
+                {"detail": "Could not deliver OTP email. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
 
-        payload = {"detail": "OTP sent."}
-        if settings.DEBUG:
-            payload["otp"] = otp
-        return Response(payload, status=status.HTTP_200_OK)
+        return Response({"detail": "OTP sent."}, status=status.HTTP_200_OK)
 
 
 class VerifyEmailOtpView(APIView):
@@ -225,6 +181,9 @@ class VerifyEmailOtpView(APIView):
             )
 
         user, created = User.objects.get_or_create(email=email)
+        if created:
+            user.tokens = 100
+            user.save(update_fields=["tokens"])
         if not user.is_verified:
             user.is_verified = True
             user.save(update_fields=["is_verified"])
@@ -301,7 +260,7 @@ class PostListCreateView(generics.ListCreateAPIView):
                 "duration_seconds",
                 "created_at",
             )
-            .order_by("-created_at")
+            .order_by("-created_at")[:50]
         )
 
     def create(self, request, *args, **kwargs):
@@ -315,8 +274,24 @@ class PostListCreateView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         _ensure_dev_bonus_tokens(self.request.user)
-        if _payload_uses_unsupported_tier(serializer.validated_data):
-            raise ValidationError("Coming soon.")
+
+        # Billboard session gate: block sends when the billboard queue is nearly full.
+        _SESSION_CAP = 300
+        _SESSION_BUFFER = 5
+        cutoff = timezone.now() - timedelta(seconds=_SESSION_CAP)
+        recent_durations = Post.objects.filter(
+            created_at__gte=cutoff
+        ).values_list('duration_seconds', flat=True)
+        session_used = min(
+            _SESSION_CAP,
+            sum(max(3, min(int(d), 300)) for d in recent_durations),
+        )
+        session_remaining = _SESSION_CAP - session_used
+        if session_remaining <= _SESSION_BUFFER:
+            raise ValidationError(
+                f"Billboard session full. Wait {session_remaining} seconds for the session to end."
+            )
+
         # Calculate cost from validated data without saving
         temp_post = Post(
             text=serializer.validated_data.get('text', ''),
@@ -336,18 +311,69 @@ class PostListCreateView(generics.ListCreateAPIView):
                 raise ValidationError(
                     f"Not enough tokens. This message costs {cost} tokens but you have {user.tokens}."
                 )
-            serializer.save(user=user)
+            post = serializer.save(user=user)
             user.tokens -= cost
             user.save(update_fields=["tokens"])
             self._updated_user_tokens = user.tokens
+            # Serialize in billboard shape now (request.user is fully loaded;
+            # the locked `user` only has id/tokens) and hand the payload to
+            # the realtime buffer on commit: held billboard long-polls wake
+            # the instant the row is visible and answer without touching the
+            # database again.
+            post.user = self.request.user
+            payload = BillboardPostSerializer(
+                post, context=self.get_serializer_context()
+            ).data
+            transaction.on_commit(
+                lambda: realtime.notify_new_post(post.pk, payload)
+            )
 
 
 class BillboardView(generics.ListAPIView):
     """Public, read-only feed the billboard website polls. Optionally filtered
-    by ?user=<id>; otherwise returns the latest posts across all users."""
+    by ?user=<id>; otherwise returns the latest posts across all users.
+
+    With ?after=<id> the response is short-circuited to [] (no DB query) when
+    nothing newer exists, and ?wait=<seconds> turns the request into a long
+    poll that returns the moment a new post is committed."""
 
     serializer_class = BillboardPostSerializer
     permission_classes = [AllowAny]
+
+    def _parse_after(self):
+        after = self.request.query_params.get("after")
+        if after in (None, ""):
+            return None
+        try:
+            return max(0, int(after))
+        except ValueError as exc:
+            raise ValidationError("after must be an integer post id.") from exc
+
+    def _parse_wait(self):
+        max_wait = float(getattr(settings, "BILLBOARD_LONGPOLL_MAX_WAIT", 25))
+        try:
+            wait = float(self.request.query_params.get("wait", 0))
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(wait, max_wait))
+
+    def list(self, request, *args, **kwargs):
+        after = self._parse_after()
+        if after is not None:
+            if realtime.get_latest_post_id() <= after:
+                wait = self._parse_wait()
+                # Nothing new: either answer [] immediately (plain poll) or
+                # hold the request until a post lands or the wait expires.
+                if wait <= 0 or not realtime.wait_for_post_after(after, wait):
+                    return Response([])
+            # Something new — serve it straight from the in-process buffer
+            # when it provably holds everything past the cursor (saves the
+            # remote DB round trip on the hottest path).
+            if not request.query_params.get("user"):
+                buffered = realtime.get_buffered_posts_after(after)
+                if buffered is not None:
+                    return Response(buffered)
+        return super().list(request, *args, **kwargs)
 
     def get_queryset(self):
         qs = Post.objects.select_related("user").only(
@@ -374,12 +400,9 @@ class BillboardView(generics.ListAPIView):
         user = self.request.query_params.get("user")
         if user:
             qs = qs.filter(user_id=user)
-        after = self.request.query_params.get("after")
-        if after not in (None, ""):
-            try:
-                qs = qs.filter(id__gt=max(0, int(after)))
-            except ValueError as exc:
-                raise ValidationError("after must be an integer post id.") from exc
+        after = self._parse_after()
+        if after is not None:
+            qs = qs.filter(id__gt=after)
         return qs.order_by("-created_at", "-id")[:50]
 
 

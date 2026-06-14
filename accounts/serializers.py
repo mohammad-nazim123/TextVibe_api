@@ -17,6 +17,10 @@ def _normalize_phone(value: str) -> str:
     return value
 
 
+def _normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
 class SendOtpSerializer(serializers.Serializer):
     phone_number = serializers.CharField(max_length=20)
 
@@ -35,10 +39,16 @@ class VerifyOtpSerializer(serializers.Serializer):
 class GoogleAuthSerializer(serializers.Serializer):
     email = serializers.EmailField()
 
+    def validate_email(self, value):
+        return _normalize_email(value)
+
 
 class VerifyEmailOtpSerializer(serializers.Serializer):
     email = serializers.EmailField()
     otp = serializers.RegexField(r"^\d{6}$", error_messages={"invalid": "Enter the 6-digit code."})
+
+    def validate_email(self, value):
+        return _normalize_email(value)
 
 
 class UserSerializer(serializers.ModelSerializer):

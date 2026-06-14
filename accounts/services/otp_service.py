@@ -12,12 +12,21 @@ Security properties:
 
 import hashlib
 import hmac
+import json
 import secrets
 
 import redis
 from django.conf import settings
 
-_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+_client = redis.from_url(
+    settings.REDIS_URL,
+    decode_responses=True,
+    socket_connect_timeout=5,
+    socket_timeout=5,
+    retry_on_timeout=True,
+    health_check_interval=30,
+)
+_MAX_ACTIVE_CODES = 3
 
 
 class OtpError(Exception):
@@ -55,6 +64,26 @@ def _digest(phone: str, otp: str) -> str:
     ).hexdigest()
 
 
+def _stored_digests(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return [value]
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, str)]
+    if isinstance(parsed, str):
+        return [parsed]
+    return []
+
+
+def _serialize_digests(digests: list[str]) -> str:
+    if len(digests) == 1:
+        return digests[0]
+    return json.dumps(digests[:_MAX_ACTIVE_CODES])
+
+
 def generate_and_store_otp(phone: str) -> str:
     """Create a 6-digit OTP, store its hash in Redis, and return the plaintext
     code (for delivery via SMS). Raises OtpCooldownError if requested too soon."""
@@ -63,13 +92,51 @@ def generate_and_store_otp(phone: str) -> str:
         raise OtpCooldownError(cooldown_ttl)
 
     otp = f"{secrets.randbelow(10 ** 6):06d}"
+    digest = _digest(phone, otp)
+    digests = [digest, *[item for item in _stored_digests(_client.get(_code_key(phone))) if item != digest]]
+    digests = digests[:_MAX_ACTIVE_CODES]
 
     pipe = _client.pipeline()
-    pipe.setex(_code_key(phone), settings.OTP_TTL_SECONDS, _digest(phone, otp))
+    pipe.setex(_code_key(phone), settings.OTP_TTL_SECONDS, _serialize_digests(digests))
     pipe.delete(_attempts_key(phone))
     pipe.setex(_cooldown_key(phone), settings.OTP_RESEND_COOLDOWN, "1")
     pipe.execute()
     return otp
+
+
+def discard_otp(phone: str, otp: str | None = None) -> None:
+    """Destroy an issued OTP and its cooldown, used when delivery fails.
+
+    When the plaintext code is supplied, remove only that code so an older
+    still-valid resend code can continue to work.
+    """
+    if otp is None:
+        _client.delete(_code_key(phone), _attempts_key(phone), _cooldown_key(phone))
+        return
+
+    code_key = _code_key(phone)
+    stored = _stored_digests(_client.get(code_key))
+    failed_digest = _digest(phone, otp)
+    remaining = [
+        digest
+        for digest in stored
+        if not hmac.compare_digest(digest, failed_digest)
+    ]
+    ttl = _client.ttl(code_key)
+
+    pipe = _client.pipeline()
+    if remaining and ttl > 0:
+        pipe.setex(code_key, ttl, _serialize_digests(remaining))
+    else:
+        pipe.delete(code_key, _attempts_key(phone))
+    pipe.delete(_cooldown_key(phone))
+    pipe.execute()
+
+
+def clear_cooldown(phone: str) -> None:
+    """Drop only the resend cooldown (used when async delivery fails) so the
+    user can request a fresh code without waiting."""
+    _client.delete(_cooldown_key(phone))
 
 
 def verify_otp(phone: str, otp: str) -> bool:
@@ -87,7 +154,8 @@ def verify_otp(phone: str, otp: str) -> bool:
         _client.delete(_code_key(phone), _attempts_key(phone))
         raise OtpMaxAttemptsError()
 
-    if hmac.compare_digest(stored, _digest(phone, otp)):
+    expected = _digest(phone, otp)
+    if any(hmac.compare_digest(stored_digest, expected) for stored_digest in _stored_digests(stored)):
         _client.delete(_code_key(phone), _attempts_key(phone))
         return True
     return False
