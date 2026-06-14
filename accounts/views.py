@@ -95,7 +95,7 @@ class VerifyOtpView(APIView):
 
         user, created = User.objects.get_or_create(phone_number=phone)
         if created:
-            user.tokens = 25
+            user.tokens = 100
             user.save(update_fields=["tokens"])
         if not user.is_verified:
             user.is_verified = True
@@ -183,7 +183,7 @@ class VerifyEmailOtpView(APIView):
 
         user, created = User.objects.get_or_create(email=email)
         if created:
-            user.tokens = 25
+            user.tokens = 100
             user.save(update_fields=["tokens"])
         if not user.is_verified:
             user.is_verified = True
