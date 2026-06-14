@@ -31,6 +31,7 @@ def _env_list(name: str, default: str = "") -> list[str]:
 SECRET_KEY = os.environ["SECRET_KEY"]
 DEBUG = _env_bool("DEBUG", False)
 ALLOWED_HOSTS = _env_list("ALLOWED_HOSTS", "localhost,127.0.0.1")
+DIRECT_DASHBOARD_EMAILS = [item.lower() for item in _env_list("DIRECT_DASHBOARD_EMAILS")]
 
 INSTALLED_APPS = [
     "django.contrib.admin",

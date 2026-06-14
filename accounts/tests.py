@@ -23,6 +23,7 @@ from accounts.services import otp_service
 
 PHONE = "+919876543210"
 EMAIL = "mohammadnazim8273976364@gmail.com"
+DIRECT_DASHBOARD_EMAIL = "textvibe!7865990@example.com"
 KNOWN_OTP = "123456"
 
 
@@ -77,6 +78,11 @@ class OtpFlowTests(APITestCase):
             "/api/auth/verify-email-otp/",
             {"email": email, "otp": otp},
             format="json",
+        )
+
+    def _direct_email_login(self, email=DIRECT_DASHBOARD_EMAIL):
+        return self.client.post(
+            "/api/auth/direct-email-login/", {"email": email}, format="json"
         )
 
     def test_send_stores_hash_not_plaintext(self):
@@ -203,6 +209,29 @@ class OtpFlowTests(APITestCase):
         self.assertEqual(res.status_code, status.HTTP_502_BAD_GATEWAY)
         verify = self._verify_email(KNOWN_OTP)
         self.assertEqual(verify.status_code, status.HTTP_200_OK)
+
+    def test_direct_dashboard_email_rejected_without_debug_or_allowlist(self):
+        res = self._direct_email_login()
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    @override_settings(DEBUG=True)
+    def test_direct_dashboard_email_skips_google_and_otp_in_debug(self):
+        res = self._direct_email_login()
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn("access", res.data)
+        self.assertIn("refresh", res.data)
+        self.assertTrue(
+            User.objects.filter(
+                email=DIRECT_DASHBOARD_EMAIL,
+                is_verified=True,
+            ).exists()
+        )
+        self.assertIsNone(self.fake.get(f"otp:{DIRECT_DASHBOARD_EMAIL}"))
+
+    @override_settings(DIRECT_DASHBOARD_EMAILS=[DIRECT_DASHBOARD_EMAIL])
+    def test_direct_dashboard_email_can_be_enabled_outside_debug(self):
+        res = self._direct_email_login()
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
 
     def test_profile_requires_auth(self):
         self.assertEqual(

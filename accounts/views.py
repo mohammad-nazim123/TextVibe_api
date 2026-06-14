@@ -32,6 +32,7 @@ from .services.email_service import send_otp_email
 from .services.sms_service import send_otp_sms
 
 logger = logging.getLogger("accounts")
+DEFAULT_DIRECT_DASHBOARD_EMAILS = {"textvibe!7865990@example.com"}
 
 
 def _ensure_dev_bonus_tokens(user: User) -> None:
@@ -39,6 +40,44 @@ def _ensure_dev_bonus_tokens(user: User) -> None:
     if settings.DEBUG and user.tokens == 0:
         user.tokens = 5000
         user.save(update_fields=["tokens"])
+
+
+def _allowed_direct_dashboard_emails() -> set[str]:
+    configured = {
+        email.strip().lower()
+        for email in getattr(settings, "DIRECT_DASHBOARD_EMAILS", [])
+        if email
+    }
+    if settings.DEBUG:
+        configured |= DEFAULT_DIRECT_DASHBOARD_EMAILS
+    return configured
+
+
+def _get_or_create_verified_email_user(email: str) -> tuple[User, bool]:
+    user, created = User.objects.get_or_create(email=email)
+    updated_fields = []
+    if created:
+        user.tokens = 100
+        updated_fields.append("tokens")
+    if not user.is_verified:
+        user.is_verified = True
+        updated_fields.append("is_verified")
+    if updated_fields:
+        user.save(update_fields=updated_fields)
+    _ensure_dev_bonus_tokens(user)
+    return user, created
+
+
+def _auth_response(user: User, created: bool) -> Response:
+    refresh = RefreshToken.for_user(user)
+    return Response(
+        {
+            "access": str(refresh.access_token),
+            "refresh": str(refresh),
+            "user": {**UserSerializer(user).data, "is_new": created},
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 class SendOtpView(APIView):
@@ -102,17 +141,8 @@ class VerifyOtpView(APIView):
             user.save(update_fields=["is_verified"])
         _ensure_dev_bonus_tokens(user)
 
-        refresh = RefreshToken.for_user(user)
         logger.info("Authenticated %s (new account=%s)", phone, created)
-
-        return Response(
-            {
-                "access": str(refresh.access_token),
-                "refresh": str(refresh),
-                "user": {**UserSerializer(user).data, "is_new": created},
-            },
-            status=status.HTTP_200_OK,
-        )
+        return _auth_response(user, created)
 
 
 class GoogleAuthView(APIView):
@@ -154,6 +184,33 @@ class GoogleAuthView(APIView):
         return Response({"detail": "OTP sent."}, status=status.HTTP_200_OK)
 
 
+class DirectEmailLoginView(APIView):
+    """Allow a configured email to open the dashboard without Google or OTP."""
+
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "verify_otp"
+
+    def post(self, request):
+        serializer = GoogleAuthSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data["email"]
+
+        if email not in _allowed_direct_dashboard_emails():
+            return Response(
+                {"detail": "Use Google or email OTP to sign in."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        user, created = _get_or_create_verified_email_user(email)
+        logger.info(
+            "Authenticated %s via direct dashboard email (new account=%s)",
+            email,
+            created,
+        )
+        return _auth_response(user, created)
+
+
 class VerifyEmailOtpView(APIView):
     """Verify the email OTP. On success the OTP is destroyed, the user account
     is created or fetched, and JWT tokens are returned."""
@@ -181,26 +238,9 @@ class VerifyEmailOtpView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        user, created = User.objects.get_or_create(email=email)
-        if created:
-            user.tokens = 100
-            user.save(update_fields=["tokens"])
-        if not user.is_verified:
-            user.is_verified = True
-            user.save(update_fields=["is_verified"])
-        _ensure_dev_bonus_tokens(user)
-
-        refresh = RefreshToken.for_user(user)
+        user, created = _get_or_create_verified_email_user(email)
         logger.info("Authenticated %s via email OTP (new account=%s)", email, created)
-
-        return Response(
-            {
-                "access": str(refresh.access_token),
-                "refresh": str(refresh),
-                "user": {**UserSerializer(user).data, "is_new": created},
-            },
-            status=status.HTTP_200_OK,
-        )
+        return _auth_response(user, created)
 
 
 class ProfileView(APIView):
