@@ -30,7 +30,24 @@ def _env_list(name: str, default: str = "") -> list[str]:
 # === Core ===
 SECRET_KEY = os.environ["SECRET_KEY"]
 DEBUG = _env_bool("DEBUG", False)
-ALLOWED_HOSTS = _env_list("ALLOWED_HOSTS", "localhost,127.0.0.1")
+
+ALLOWED_HOSTS = [
+    "localhost",
+    "127.0.0.1",
+    "13.212.104.3",
+    "api-team-textvibe.educonnectz.in",
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://api-team-textvibe.educonnectz.in",
+    "http://api-team-textvibe.educonnectz.in",
+]
+
+CORS_ALLOWED_ORIGINS = [
+    "https://api-team-textvibe.educonnectz.in",
+    "http://api-team-textvibe.educonnectz.in",
+]
+
 DIRECT_DASHBOARD_EMAILS = [item.lower() for item in _env_list("DIRECT_DASHBOARD_EMAILS")]
 
 INSTALLED_APPS = [
