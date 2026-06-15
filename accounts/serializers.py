@@ -106,6 +106,7 @@ class PostSerializer(serializers.ModelSerializer):
     style_runs = _JSONStringField(required=False, default=list)
     border = _JSONStringField(required=False, allow_null=True)
     background_texture = _JSONStringField(required=False, allow_null=True)
+    text = serializers.CharField(required=False, allow_blank=True, default="")
 
     class Meta:
         model = Post
@@ -127,6 +128,11 @@ class PostSerializer(serializers.ModelSerializer):
             "created_at",
         )
         read_only_fields = ("id", "created_at")
+
+    def validate(self, data):
+        if not data.get("text", "").strip() and not data.get("image"):
+            raise serializers.ValidationError({"text": "Write something or add a photo to send."})
+        return data
 
     def validate_duration_seconds(self, value):
         # Clamp to the billboard's bounds: at least 3s, at most 5 minutes.

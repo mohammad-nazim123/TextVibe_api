@@ -50,7 +50,7 @@ class Post(models.Model):
     user = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name="posts"
     )
-    text = models.TextField()
+    text = models.TextField(blank=True, default="")
     image = models.ImageField(upload_to="posts/", blank=True, null=True)
     canvas_image = models.ImageField(upload_to="posts/canvas/", blank=True, null=True)
     text_image = models.ImageField(upload_to="posts/text/", blank=True, null=True)
