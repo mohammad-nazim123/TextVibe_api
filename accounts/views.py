@@ -21,9 +21,11 @@ from .serializers import (
     GoogleAuthSerializer,
     PostSerializer,
     ProfileUpdateSerializer,
+    RegisterSerializer,
     SendOtpSerializer,
     SupportMessageSerializer,
     UserSerializer,
+    UsernameLoginSerializer,
     VerifyEmailOtpSerializer,
     VerifyOtpSerializer,
 )
@@ -241,6 +243,59 @@ class VerifyEmailOtpView(APIView):
         user, created = _get_or_create_verified_email_user(email)
         logger.info("Authenticated %s via email OTP (new account=%s)", email, created)
         return _auth_response(user, created)
+
+
+class RegisterView(APIView):
+    """Create a new account with username and password."""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        username = serializer.validated_data["username"]
+        password = serializer.validated_data["password"]
+
+        user = User(username=username, name=username, is_verified=True, tokens=100)
+        user.set_password(password)
+        user.save()
+        logger.info("Registered new user via username/password: %s", username)
+        return _auth_response(user, created=True)
+
+
+class UsernameLoginView(APIView):
+    """Authenticate with username and password, returning JWT tokens."""
+
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = UsernameLoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        username = serializer.validated_data["username"]
+        password = serializer.validated_data["password"]
+
+        try:
+            user = User.objects.get(username__iexact=username)
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "Invalid username or password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not user.check_password(password):
+            return Response(
+                {"detail": "Invalid username or password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not user.is_active:
+            return Response(
+                {"detail": "This account has been disabled."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        logger.info("Authenticated %s via username/password", username)
+        return _auth_response(user, created=False)
 
 
 class ProfileView(APIView):

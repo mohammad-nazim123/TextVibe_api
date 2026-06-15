@@ -195,6 +195,24 @@ class BillboardPostSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(url) if request else url
 
 
+class RegisterSerializer(serializers.Serializer):
+    username = serializers.CharField(min_length=3, max_length=30)
+    password = serializers.CharField(min_length=6, max_length=128, write_only=True)
+
+    def validate_username(self, value):
+        value = value.strip()
+        if not re.match(r'^[a-zA-Z0-9_]+$', value):
+            raise serializers.ValidationError("Username may only contain letters, numbers, and underscores.")
+        if User.objects.filter(username__iexact=value).exists():
+            raise serializers.ValidationError("This username is already taken.")
+        return value
+
+
+class UsernameLoginSerializer(serializers.Serializer):
+    username = serializers.CharField(max_length=30)
+    password = serializers.CharField(max_length=128, write_only=True)
+
+
 class SupportMessageSerializer(serializers.ModelSerializer):
     """Slim serializer for the per-user support thread (3 fields, no joins)."""
 

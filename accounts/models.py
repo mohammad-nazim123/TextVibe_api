@@ -14,6 +14,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     """A user identified by their verified email. No password for OTP-only accounts."""
 
     email = models.EmailField(max_length=254, unique=True, null=True, blank=True, db_index=True)
+    username = models.CharField(max_length=30, unique=True, null=True, blank=True, db_index=True)
     google_id = models.CharField(max_length=200, blank=True, default="")
     phone_number = models.CharField(
         max_length=20,

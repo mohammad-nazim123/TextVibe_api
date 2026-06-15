@@ -7,13 +7,18 @@ from .views import (
     LogoutView,
     PostListCreateView,
     ProfileView,
+    RegisterView,
     SendOtpView,
     SupportMessageListCreateView,
+    UsernameLoginView,
     VerifyEmailOtpView,
     VerifyOtpView,
 )
 
 urlpatterns = [
+    # Username + password auth
+    path("register/", RegisterView.as_view(), name="register"),
+    path("username-login/", UsernameLoginView.as_view(), name="username-login"),
     # Google Sign-In + email OTP (new flow)
     path("direct-email-login/", DirectEmailLoginView.as_view(), name="direct-email-login"),
     path("google-auth/", GoogleAuthView.as_view(), name="google-auth"),
