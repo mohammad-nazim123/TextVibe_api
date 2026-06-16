@@ -53,6 +53,7 @@ class VerifyEmailOtpSerializer(serializers.Serializer):
 
 class UserSerializer(serializers.ModelSerializer):
     avatar = serializers.SerializerMethodField()
+    subscription_tier = serializers.CharField(source="active_subscription_tier", read_only=True)
 
     class Meta:
         model = User
@@ -63,6 +64,8 @@ class UserSerializer(serializers.ModelSerializer):
             "name",
             "avatar",
             "tokens",
+            "subscription_tier",
+            "subscription_expires_at",
             "is_verified",
             "date_joined",
         )

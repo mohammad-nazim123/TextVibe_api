@@ -7,14 +7,24 @@ from .models import Post, SupportMessage, User
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     ordering = ("-date_joined",)
-    list_display = ("email", "phone_number", "name", "tokens", "is_verified", "is_staff", "is_active", "date_joined")
-    list_filter = ("is_verified", "is_staff", "is_active")
+    list_display = ("email", "phone_number", "name", "tokens", "subscription_tier", "is_verified", "is_staff", "is_active", "date_joined")
+    list_filter = ("is_verified", "is_staff", "is_active", "subscription_tier")
     search_fields = ("email", "phone_number", "name")
     readonly_fields = ("date_joined", "last_login")
     filter_horizontal = ("groups", "user_permissions")
     fieldsets = (
         (None, {"fields": ("email", "phone_number", "password")}),
         ("Profile", {"fields": ("name", "avatar", "tokens")}),
+        (
+            "Subscription",
+            {
+                "fields": (
+                    "subscription_tier",
+                    "subscription_purchased_at",
+                    "subscription_expires_at",
+                )
+            },
+        ),
         ("Status", {"fields": ("is_active", "is_verified")}),
         ("Permissions", {"fields": ("is_staff", "is_superuser", "groups", "user_permissions")}),
         ("Dates", {"fields": ("last_login", "date_joined")}),

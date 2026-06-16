@@ -34,7 +34,7 @@ DEBUG = _env_bool("DEBUG", False)
 ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
-    "13.212.104.3",
+    "54.169.137.220",
     "api-team-textvibe.educonnectz.in",
 ]
 

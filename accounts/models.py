@@ -1,6 +1,7 @@
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.core.validators import RegexValidator
 from django.db import models
+from django.utils import timezone
 
 from .managers import UserManager
 
@@ -27,6 +28,18 @@ class User(AbstractBaseUser, PermissionsMixin):
     name = models.CharField(max_length=80, blank=True, default="")
     avatar = models.ImageField(upload_to="avatars/", blank=True, null=True)
     tokens = models.PositiveIntegerField(default=0)
+
+    SUBSCRIPTION_TIER_CHOICES = [
+        ("none", "None"),
+        ("premium", "Premium"),
+        ("legendary", "Legendary"),
+    ]
+    subscription_tier = models.CharField(
+        max_length=10, choices=SUBSCRIPTION_TIER_CHOICES, default="none"
+    )
+    subscription_purchased_at = models.DateTimeField(null=True, blank=True)
+    subscription_expires_at = models.DateTimeField(null=True, blank=True)
+
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     is_verified = models.BooleanField(default=False)
@@ -42,6 +55,13 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.email or self.phone_number or f"user:{self.pk}"
+
+    @property
+    def active_subscription_tier(self):
+        """Effective tier right now, ignoring an expired purchase without mutating it."""
+        if self.subscription_expires_at and self.subscription_expires_at > timezone.now():
+            return self.subscription_tier
+        return "none"
 
 
 class Post(models.Model):

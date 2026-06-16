@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Payment, TokenPackage
+from .models import Payment, SubscriptionPayment, SubscriptionPlan, TokenPackage
 
 
 @admin.register(TokenPackage)
@@ -8,6 +8,13 @@ class TokenPackageAdmin(admin.ModelAdmin):
     list_display = ["amount", "tokens", "is_active", "created_at"]
     list_filter = ["is_active", "created_at"]
     search_fields = ["amount"]
+    ordering = ["amount"]
+
+
+@admin.register(SubscriptionPlan)
+class SubscriptionPlanAdmin(admin.ModelAdmin):
+    list_display = ["tier", "amount", "duration_days", "is_active", "created_at"]
+    list_filter = ["tier", "is_active"]
     ordering = ["amount"]
 
 
@@ -23,6 +30,35 @@ class PaymentAdmin(admin.ModelAdmin):
         "created_at",
     ]
     list_filter = ["status", "payment_method", "created_at"]
+    search_fields = [
+        "razorpay_order_id",
+        "razorpay_payment_id",
+        "payment_method",
+        "user__email",
+        "user__phone_number",
+    ]
+    readonly_fields = [
+        "razorpay_order_id",
+        "razorpay_payment_id",
+        "payment_method",
+        "created_at",
+        "updated_at",
+    ]
+    ordering = ["-created_at"]
+
+
+@admin.register(SubscriptionPayment)
+class SubscriptionPaymentAdmin(admin.ModelAdmin):
+    list_display = [
+        "razorpay_order_id",
+        "payment_method",
+        "user",
+        "amount",
+        "tier",
+        "status",
+        "created_at",
+    ]
+    list_filter = ["status", "payment_method", "tier", "created_at"]
     search_fields = [
         "razorpay_order_id",
         "razorpay_payment_id",

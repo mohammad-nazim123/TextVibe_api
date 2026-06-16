@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Payment, TokenPackage
+from .models import Payment, SubscriptionPlan, TokenPackage
 
 
 def _validate_active_package_id(value):
@@ -8,10 +8,22 @@ def _validate_active_package_id(value):
     return value
 
 
+def _validate_active_plan_id(value):
+    if not SubscriptionPlan.objects.filter(id=value, is_active=True).exists():
+        raise serializers.ValidationError("Invalid or inactive plan.")
+    return value
+
+
 class TokenPackageSerializer(serializers.ModelSerializer):
     class Meta:
         model = TokenPackage
         fields = ["id", "amount", "tokens"]
+
+
+class SubscriptionPlanSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SubscriptionPlan
+        fields = ["id", "tier", "amount", "duration_days"]
 
 
 class PaymentSerializer(serializers.ModelSerializer):
@@ -54,6 +66,37 @@ class InitiatePaymentSerializer(serializers.Serializer):
 
 
 class VerifyPaymentSerializer(serializers.Serializer):
+    razorpay_order_id = serializers.CharField(max_length=100)
+    razorpay_payment_id = serializers.CharField(max_length=100)
+    razorpay_signature = serializers.CharField(max_length=256)
+
+
+class PurchaseSubscriptionSerializer(serializers.Serializer):
+    """Complete a temporary direct subscription purchase without an external gateway."""
+
+    plan_id = serializers.IntegerField()
+    payment_method = serializers.ChoiceField(
+        choices=[
+            Payment.PAYMENT_METHOD_GOOGLE_PLAY,
+            Payment.PAYMENT_METHOD_UPI,
+            Payment.PAYMENT_METHOD_CARD,
+            Payment.PAYMENT_METHOD_NETBANKING,
+            Payment.PAYMENT_METHOD_WALLET,
+        ]
+    )
+
+    def validate_plan_id(self, value):
+        return _validate_active_plan_id(value)
+
+
+class InitiateSubscriptionPaymentSerializer(serializers.Serializer):
+    plan_id = serializers.IntegerField()
+
+    def validate_plan_id(self, value):
+        return _validate_active_plan_id(value)
+
+
+class VerifySubscriptionPaymentSerializer(serializers.Serializer):
     razorpay_order_id = serializers.CharField(max_length=100)
     razorpay_payment_id = serializers.CharField(max_length=100)
     razorpay_signature = serializers.CharField(max_length=256)

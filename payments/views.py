@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import logging
 import os
+from datetime import timedelta
 from uuid import uuid4
 
 try:
@@ -11,18 +12,23 @@ except ImportError:  # pragma: no cover - covered by dependency checks in deploy
 from django.core.cache import cache
 from django.db import transaction
 from django.db.models import F
+from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Payment, TokenPackage
+from .models import Payment, SubscriptionPlan, SubscriptionPayment, TokenPackage
 from .serializers import (
     InitiatePaymentSerializer,
+    InitiateSubscriptionPaymentSerializer,
     PaymentSerializer,
     PurchasePaymentSerializer,
+    PurchaseSubscriptionSerializer,
+    SubscriptionPlanSerializer,
     TokenPackageSerializer,
     VerifyPaymentSerializer,
+    VerifySubscriptionPaymentSerializer,
 )
 
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
@@ -262,3 +268,211 @@ class PaymentHistoryView(generics.ListAPIView):
             "status",
             "created_at",
         ).order_by("-created_at")[:100]
+
+
+class SubscriptionPlanListView(generics.ListAPIView):
+    """List all active subscription plans (Premium/Legendary). Plans rarely
+    change, so the serialized list is served from cache for 60s."""
+
+    queryset = SubscriptionPlan.objects.filter(is_active=True).only(
+        "id", "tier", "amount", "duration_days"
+    ).order_by("amount")
+    serializer_class = SubscriptionPlanSerializer
+    permission_classes = [AllowAny]
+
+    def list(self, request, *args, **kwargs):
+        data = cache.get_or_set(
+            "subscription_plans_v1",
+            lambda: self.get_serializer(self.get_queryset(), many=True).data,
+            60,
+        )
+        return Response(data)
+
+
+def _activate_subscription(user, plan):
+    now = timezone.now()
+    user.subscription_tier = plan.tier
+    user.subscription_purchased_at = now
+    user.subscription_expires_at = now + timedelta(days=plan.duration_days)
+    user.save(
+        update_fields=[
+            "subscription_tier",
+            "subscription_purchased_at",
+            "subscription_expires_at",
+        ]
+    )
+
+
+class PurchaseSubscriptionView(APIView):
+    """Temporarily activate a subscription immediately after a payment option is tapped."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = PurchaseSubscriptionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        plan = SubscriptionPlan.objects.get(
+            id=serializer.validated_data["plan_id"], is_active=True
+        )
+        payment_method = serializer.validated_data["payment_method"]
+
+        with transaction.atomic():
+            payment = SubscriptionPayment.objects.create(
+                user=request.user,
+                plan=plan,
+                razorpay_order_id=_generate_internal_reference(),
+                amount=plan.amount,
+                tier=plan.tier,
+                payment_method=payment_method,
+                status="success",
+            )
+            _activate_subscription(request.user, plan)
+
+        logger.info(
+            "Mock subscription payment %s completed via %s. Activated %s tier for user %s",
+            payment.razorpay_order_id,
+            payment_method,
+            plan.tier,
+            request.user.id,
+        )
+
+        return Response(
+            {
+                "detail": "Subscription activated",
+                "payment_id": payment.id,
+                "reference": payment.razorpay_order_id,
+                "payment_method": payment.payment_method,
+                "subscription_tier": request.user.subscription_tier,
+                "subscription_expires_at": request.user.subscription_expires_at,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class InitiateSubscriptionPaymentView(APIView):
+    """Create a Razorpay order for a subscription plan and return order details."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = InitiateSubscriptionPaymentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        plan = SubscriptionPlan.objects.get(
+            id=serializer.validated_data["plan_id"], is_active=True
+        )
+
+        if not _gateway_is_configured():
+            logger.error("Razorpay subscription initiation requested before gateway configuration.")
+            return _gateway_unavailable_response()
+
+        try:
+            client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+            order = client.order.create({
+                "amount": plan.amount * 100,
+                "currency": "INR",
+                "receipt": f"plan{plan.id}_{uuid4().hex[:8]}",
+            })
+        except Exception:
+            logger.exception(
+                "Razorpay order creation failed for plan %s and user %s",
+                plan.id,
+                request.user.id,
+            )
+            return Response(
+                {"detail": "Could not create payment order. Please try again later."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        order_id = order.get("id") if isinstance(order, dict) else None
+        if not order_id:
+            logger.error("Razorpay order response did not include an id: %s", order)
+            return Response(
+                {"detail": "Could not create payment order. Please try again later."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        SubscriptionPayment.objects.create(
+            user=request.user,
+            plan=plan,
+            razorpay_order_id=order_id,
+            amount=plan.amount,
+            tier=plan.tier,
+            status="pending",
+        )
+
+        return Response({
+            "order_id": order_id,
+            "amount": plan.amount,
+            "tier": plan.tier,
+            "currency": "INR",
+            "key_id": RAZORPAY_KEY_ID,
+        })
+
+
+class VerifySubscriptionPaymentView(APIView):
+    """Verify Razorpay signature, mark subscription payment success, and activate the tier."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = VerifySubscriptionPaymentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        order_id = serializer.validated_data["razorpay_order_id"]
+        payment_id = serializer.validated_data["razorpay_payment_id"]
+        signature = serializer.validated_data["razorpay_signature"]
+
+        if not RAZORPAY_KEY_SECRET:
+            logger.error("Razorpay subscription verification requested before gateway configuration.")
+            return _gateway_unavailable_response()
+
+        message = f"{order_id}|{payment_id}".encode("utf-8")
+        expected = hmac.new(
+            RAZORPAY_KEY_SECRET.encode("utf-8"),
+            message,
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected, signature):
+            logger.warning(
+                "Signature mismatch for subscription order %s from user %s", order_id, request.user.id
+            )
+            return Response(
+                {"detail": "Invalid payment signature."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            with transaction.atomic():
+                payment = SubscriptionPayment.objects.select_for_update().get(
+                    razorpay_order_id=order_id,
+                    user=request.user,
+                    status="pending",
+                )
+                payment.razorpay_payment_id = payment_id
+                payment.status = "success"
+                payment.save(update_fields=["razorpay_payment_id", "status", "updated_at"])
+
+                _activate_subscription(request.user, payment.plan)
+        except SubscriptionPayment.DoesNotExist:
+            return Response(
+                {"detail": "Order not found or already processed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        logger.info(
+            "Subscription payment %s verified for order %s. Activated %s tier for user %s",
+            payment_id,
+            order_id,
+            payment.tier,
+            request.user.id,
+        )
+
+        return Response({
+            "detail": "Payment verified and subscription activated",
+            "payment_id": payment.id,
+            "subscription_tier": request.user.subscription_tier,
+            "subscription_expires_at": request.user.subscription_expires_at,
+        })

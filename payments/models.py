@@ -70,3 +70,54 @@ class Payment(models.Model):
 
     def __str__(self):
         return f"Payment {self.razorpay_order_id} - {self.status}"
+
+
+class SubscriptionPlan(models.Model):
+    """Premium/Legendary subscription plans users can purchase."""
+
+    TIER_CHOICES = [
+        ("premium", "Premium"),
+        ("legendary", "Legendary"),
+    ]
+
+    tier = models.CharField(max_length=10, choices=TIER_CHOICES, unique=True)
+    amount = models.PositiveIntegerField(help_text="Cost in rupees")
+    duration_days = models.PositiveIntegerField(default=30)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["amount"]
+        verbose_name_plural = "Subscription Plans"
+
+    def __str__(self):
+        return f"{self.get_tier_display()} - ₹{self.amount}/{self.duration_days}d"
+
+
+class SubscriptionPayment(models.Model):
+    """Tracks all premium/legendary subscription purchase transactions."""
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="subscription_payments")
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True)
+    razorpay_order_id = models.CharField(max_length=100, unique=True, db_index=True)
+    razorpay_payment_id = models.CharField(max_length=100, blank=True, null=True, unique=True)
+    payment_method = models.CharField(
+        max_length=20,
+        choices=Payment.PAYMENT_METHOD_CHOICES,
+        default=Payment.PAYMENT_METHOD_LEGACY,
+    )
+    amount = models.PositiveIntegerField(help_text="Amount in rupees")
+    tier = models.CharField(max_length=10, choices=SubscriptionPlan.TIER_CHOICES)
+    status = models.CharField(max_length=20, choices=Payment.STATUS_CHOICES, default="pending")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name_plural = "Subscription Payments"
+        indexes = [
+            models.Index(fields=["user", "-created_at"], name="subpay_user_created_idx"),
+        ]
+
+    def __str__(self):
+        return f"SubscriptionPayment {self.razorpay_order_id} - {self.status}"
